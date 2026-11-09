@@ -16,7 +16,7 @@ read -r TAG SHA <web-theme.pin || true
 [ -n "${TAG:-}" ] && [ -n "${SHA:-}" ] ||
   { echo "web-theme.pin must hold '<tag> <sha256>'" >&2; exit 1; }
 DEST=target/theme
-URL="https://github.com/monitor-probe/monitor-theme-default/releases/download/$TAG/theme.tar.gz"
+URL="https://github.com/goldsonhwy/monitor-theme-design/releases/download/$TAG/theme.tar.gz"
 
 # Already unpacked at this pin. A theme placed here manually with a matching
 # stamp is also left alone, which is how an unreleased theme is built against.

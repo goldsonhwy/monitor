@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS node (
   -- Set in the panel and shown on the status page, unlike `remark`. Empty is
   -- none.
   public_remark TEXT NOT NULL DEFAULT '',
+  -- Optional provider banner shown before the node name on the public page.
+  provider_image_url TEXT NOT NULL DEFAULT '',
+  provider_link_url TEXT NOT NULL DEFAULT '',
+  nq_link_url TEXT NOT NULL DEFAULT '',
   -- Set in the panel, each replacing the address shown for its family. Empty
   -- means automatic. Panel only, like the reported addresses.
   ipv4_pin TEXT NOT NULL DEFAULT '', ipv6_pin TEXT NOT NULL DEFAULT '',
@@ -142,6 +146,13 @@ CREATE TABLE IF NOT EXISTS traffic (
   day_rx INTEGER NOT NULL DEFAULT 0,
   day_tx INTEGER NOT NULL DEFAULT 0,
   day_start TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS ip_info_cache (
+  node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+  ipv4 TEXT NOT NULL,
+  cached_at INTEGER NOT NULL,
+  data TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS metric (
@@ -216,6 +227,13 @@ CREATE TABLE IF NOT EXISTS ping_hour (
   PRIMARY KEY (node_id, ts, task_id)
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS nq_benchmark_cache (
+  node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+  source_url TEXT NOT NULL,
+  cached_at INTEGER NOT NULL,
+  data TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
   expires_at INTEGER NOT NULL
@@ -236,7 +254,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 17;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -413,7 +431,38 @@ fn migrate_to_13(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "ip_other TEXT NOT NULL DEFAULT ''")
 }
 
-/// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
+fn migrate_to_14(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "provider_image_url TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "provider_link_url TEXT NOT NULL DEFAULT ''")
+}
+
+fn migrate_to_15(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "nq_link_url TEXT NOT NULL DEFAULT ''")
+}
+
+fn migrate_to_16(conn: &Connection) -> Result<()> {
+    Ok(conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ip_info_cache (
+           node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+           ipv4 TEXT NOT NULL,
+           cached_at INTEGER NOT NULL,
+           data TEXT NOT NULL
+         );",
+    )?)
+}
+
+fn migrate_to_17(conn: &Connection) -> Result<()> {
+    Ok(conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS nq_benchmark_cache (
+           node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+           source_url TEXT NOT NULL,
+           cached_at INTEGER NOT NULL,
+           data TEXT NOT NULL
+         );",
+    )?)
+}
+
+/// Brings a database already in service up to `SCHEMA_VERSION`.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
 ///
@@ -465,13 +514,25 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 13 {
         migrate_to_13(&tx)?;
     }
+    if from < 14 {
+        migrate_to_14(&tx)?;
+    }
+    if from < 15 {
+        migrate_to_15(&tx)?;
+    }
+    if from < 16 {
+        migrate_to_16(&tx)?;
+    }
+    if from < 17 {
+        migrate_to_17(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
 /// Every table this build keeps.
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 11] = [
     "setting",
     "node",
     "traffic",
@@ -482,6 +543,7 @@ const TABLES: [&str; 10] = [
     "session",
     "metric_hour",
     "ping_hour",
+    "nq_benchmark_cache",
 ];
 
 /// The tables `migrate_to_11` adds. A backup taken before it lacks them and is
@@ -515,6 +577,13 @@ pub struct Node {
     /// Monthly allowance in bytes; 0 means unmetered.
     #[serde(default)]
     pub traffic_limit: i64,
+    /// Optional provider banner and destination configured in the panel.
+    #[serde(default)]
+    pub provider_image_url: String,
+    #[serde(default)]
+    pub provider_link_url: String,
+    #[serde(default)]
+    pub nq_link_url: String,
     /// How the allowance is counted: sum, max, up or down.
     #[serde(default = "sum")]
     pub traffic_mode: String,
@@ -607,6 +676,9 @@ pub struct NodePatch {
     pub expires_at: Option<Option<String>>,
     pub remark: Option<String>,
     pub public_remark: Option<String>,
+    pub provider_image_url: Option<String>,
+    pub provider_link_url: Option<String>,
+    pub nq_link_url: Option<String>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
@@ -1107,11 +1179,86 @@ impl Db {
 
     // ---- nodes ----
 
+    pub fn get_nq_benchmark_cache(&self, node_id: i64) -> Result<Option<(String, i64, String)>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row(
+                "SELECT source_url, cached_at, data FROM nq_benchmark_cache WHERE node_id=?1",
+                [node_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn nodes_needing_nq(&self, now: i64, ttl: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.nq_link_url FROM node n LEFT JOIN nq_benchmark_cache c ON c.node_id=n.id
+             WHERE n.nq_link_url LIKE 'https://nodequality.com/r/%'
+               AND (c.node_id IS NULL OR c.source_url != n.nq_link_url
+                    OR (c.data = 'null' AND c.cached_at <= ?1)
+                    OR (c.data != 'null' AND c.cached_at <= ?2))
+             ORDER BY COALESCE(c.cached_at, 0), n.id LIMIT ?3",
+        )?;
+        let rows =
+            stmt.query_map(params![now - 300, now - ttl, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn save_nq_benchmark_cache(
+        &self,
+        node_id: i64,
+        source_url: &str,
+        cached_at: i64,
+        data: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO nq_benchmark_cache (node_id, source_url, cached_at, data) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(node_id) DO UPDATE SET source_url=excluded.source_url, cached_at=excluded.cached_at, data=excluded.data",
+            params![node_id, source_url, cached_at, data],
+        )?;
+        Ok(())
+    }
+
     pub fn nodes(&self) -> Result<Vec<Node>> {
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT * FROM node ORDER BY sort, id")?;
         let rows = stmt.query_map([], |r| Ok(row_to_node(r)))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn get_ip_info_cache(&self, node_id: i64) -> Result<Option<(String, i64, String)>> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT ipv4, cached_at, data FROM ip_info_cache WHERE node_id=?1", [node_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?)
+    }
+
+    pub fn nodes_needing_ip_info(&self, now: i64, ttl: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT n.id, CASE WHEN n.ipv4_pin != '' THEN n.ipv4_pin
+                               WHEN n.ipv4 != '' THEN n.ipv4
+                               ELSE '' END
+             FROM node n LEFT JOIN ip_info_cache c ON c.node_id=n.id
+             WHERE (c.node_id IS NULL OR c.cached_at <= ?1 OR c.ipv4 != CASE WHEN n.ipv4_pin != '' THEN n.ipv4_pin
+                               WHEN n.ipv4 != '' THEN n.ipv4 ELSE '' END)
+               AND (CASE WHEN n.ipv4_pin != '' THEN n.ipv4_pin WHEN n.ipv4 != '' THEN n.ipv4 ELSE '' END) != ''
+             ORDER BY COALESCE(c.cached_at, 0), n.id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now - ttl, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn save_ip_info_cache(&self, node_id: i64, ipv4: &str, cached_at: i64, data: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO ip_info_cache (node_id, ipv4, cached_at, data) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(node_id) DO UPDATE SET ipv4=excluded.ipv4, cached_at=excluded.cached_at, data=excluded.data",
+            params![node_id, ipv4, cached_at, data],
+        )?;
+        Ok(())
     }
 
     pub fn node(&self, id: i64) -> Result<Option<Node>> {
@@ -1214,7 +1361,10 @@ impl Db {
                                  notify=COALESCE(?13,notify), country_pin=COALESCE(?14,country_pin),
                                  ipv4_pin=COALESCE(?15,ipv4_pin), ipv6_pin=COALESCE(?16,ipv6_pin),
                                  group_name=COALESCE(?17,group_name),
-                                 public_remark=COALESCE(?18,public_remark)
+                                 public_remark=COALESCE(?18,public_remark),
+                                 provider_image_url=COALESCE(?19,provider_image_url),
+                                 provider_link_url=COALESCE(?20,provider_link_url),
+                                 nq_link_url=COALESCE(?21,nq_link_url)
                  WHERE id=?1",
             )?;
             for id in ids {
@@ -1236,7 +1386,10 @@ impl Db {
                     n.ipv4_pin,
                     n.ipv6_pin,
                     n.group,
-                    n.public_remark
+                    n.public_remark,
+                    n.provider_image_url,
+                    n.provider_link_url,
+                    n.nq_link_url
                 ])?;
                 // Dropping the transaction uncommitted rolls back the nodes
                 // already updated.
@@ -2513,7 +2666,7 @@ impl Db {
         }
         // The hourly tables are created by the migration below; their columns are
         // compared with the rest once it has run.
-        for table in TABLES.iter().filter(|t| !HOURLY_TABLES.contains(t)) {
+        for table in TABLES.iter().filter(|t| !HOURLY_TABLES.contains(t) && **t != "nq_benchmark_cache") {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -2540,7 +2693,7 @@ impl Db {
         // arrangement in which the restore has failed and the original data is
         // also gone.
         migrate(&candidate, version)?;
-        // The migration lands in a -wal beside a backup taken from a running hub.
+        migrate_to_17(&candidate)?;
         // Checkpointed here so the copy below reads a single file.
         let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
 
@@ -2753,6 +2906,9 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
         remark: s("remark"),
         public_remark: s("public_remark"),
+        provider_image_url: s("provider_image_url"),
+        provider_link_url: s("provider_link_url"),
+        nq_link_url: s("nq_link_url"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
         traffic_reset_day: n("traffic_reset_day") as u32,
@@ -4154,7 +4310,7 @@ mod tests {
         // One row per table, plus the id high marks `open` records.
         assert_eq!(
             upgraded.len(),
-            TABLES.len() - HOURLY_TABLES.len() + ID_TABLES.len(),
+            TABLES.len() - HOURLY_TABLES.len() - 1 + ID_TABLES.len(),
             "every row survives: {upgraded:#?}"
         );
 

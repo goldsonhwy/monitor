@@ -29,7 +29,9 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod ip_info;
 mod notify;
+mod nq_quality;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -86,6 +88,12 @@ pub struct App {
     /// asks rather than on a timer, so a hub nobody opens makes no outbound
     /// request; see `api::versions`.
     pub releases: Mutex<Releases>,
+    /// Serializes low-rate IP intelligence refreshes so multiple ticks never
+    /// issue duplicate provider requests.
+    pub ip_info_refresh: tokio::sync::Mutex<()>,
+    pub nq_refresh: tokio::sync::Mutex<()>,
+    pub nq_benchmarks: RwLock<HashMap<i64, (String, serde_json::Value)>>,
+    pub nq_signing_ip: Mutex<String>,
 }
 
 #[derive(Default, Clone)]
@@ -114,6 +122,10 @@ impl App {
             themes,
             notes,
             releases: Mutex::default(),
+            ip_info_refresh: tokio::sync::Mutex::new(()),
+            nq_refresh: tokio::sync::Mutex::new(()),
+            nq_benchmarks: RwLock::default(),
+            nq_signing_ip: Mutex::new(String::new()),
         }
     }
 
@@ -617,6 +629,7 @@ async fn main() -> Result<()> {
     }
 
     let held = app.clone();
+    tokio::spawn(nq_quality::watch(app.clone()));
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
@@ -1013,6 +1026,20 @@ async fn housekeeping(app: Shared) {
         .await;
         if let Err(e) = done.map_err(anyhow::Error::from).and_then(|r| r) {
             warn!("maintaining history failed: {e:#}");
+        }
+        if let Err(e) = crate::nq_quality::refresh_now(&app).await {
+            warn!("refreshing NodeQuality benchmark cache failed: {e:#}");
+        }
+        let now = Local::now();
+        let refresh_result = if now.hour() == 4 {
+            crate::ip_info::refresh_all(&app).await.map(|count| {
+                info!(count, "daily full IP2Location refresh completed");
+            })
+        } else {
+            crate::ip_info::refresh_one(&app).await
+        };
+        if let Err(e) = refresh_result {
+            warn!("refreshing node IP information failed: {e:#}");
         }
         tokio::time::sleep(until_next_hour(Local::now())).await;
     }

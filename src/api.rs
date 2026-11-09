@@ -208,6 +208,7 @@ fn node_view(
     traffic: &Traffic,
     full: bool,
     now: DateTime<Local>,
+    app: &App,
 ) -> Value {
     // The three capacities arrive in every `Metrics`. The stored figure follows the
     // reports a minute at a time and as the session ends, so it lags a disk mounted
@@ -238,6 +239,9 @@ fn node_view(
         "group": node.group,
         // Written by the operator for visitors, unlike `remark` below.
         "public_remark": node.public_remark,
+        "provider_image_url": node.provider_image_url,
+        "provider_link_url": node.provider_link_url,
+        "nq_link_url": node.nq_link_url,
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
@@ -280,7 +284,9 @@ fn node_view(
         // the public page already shows, so this one is public as well.
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
+        "ip_info": crate::ip_info::public_cached(app, node.id, node),
     });
+    view["nq_benchmark"] = json!(crate::nq_quality::cached(app, node));
     // An allowlist rather than a denylist, for the panel as well: the agent ships
     // from its own repository, so a field added there would otherwise reach
     // anonymous visitors the day it is released, and a node token in the wrong
@@ -330,6 +336,9 @@ fn node_view(
         view["remark"] = json!(node.remark);
         view["notify"] = json!(node.notify);
     }
+    if let Some(info) = crate::ip_info::public_cached(app, node.id, node) {
+        view["ip_info"] = info;
+    }
     view
 }
 
@@ -344,7 +353,7 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, now))
+        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, now, app))
         .collect())
 }
 
@@ -894,6 +903,7 @@ fn name_error(name: &mut String) -> Option<&'static str> {
 /// A public remark goes to every visitor in every frame, every two seconds, where
 /// a node's public view is about 1 KB; a hundred CJK characters add 300 bytes.
 const MAX_PUBLIC_REMARK: usize = 100;
+const MAX_PROVIDER_URL: usize = 2048;
 
 /// Normalizes the currency and billing cycle, or names the one that cannot be
 /// stored. The currency is held to the ISO 4217 form of three letters, the only
@@ -933,6 +943,16 @@ fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
         *text = text.trim().to_owned();
         if text.chars().count() > MAX_PUBLIC_REMARK || text.chars().any(char::is_control) {
             return Some("公开备注最多 100 个字，不能含控制字符");
+        }
+    }
+    for url in [&mut node.provider_image_url, &mut node.provider_link_url, &mut node.nq_link_url] {
+        let Some(url) = url else { continue };
+        *url = url.trim().to_owned();
+        if url.chars().count() > MAX_PROVIDER_URL || url.chars().any(char::is_control) {
+            return Some("服务商图片和链接地址最多 2048 个字符，不能含控制字符");
+        }
+        if !url.is_empty() && !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Some("服务商图片和链接地址必须使用 http:// 或 https://");
         }
     }
     node_limits(node.traffic_reset_day, node.price, node.traffic_limit)
@@ -3235,6 +3255,33 @@ mod tests {
         assert_eq!((&public["public_remark"], &public["remark"]), (&json!("CN2 GIA"), &Value::Null));
         // Counted in characters, not bytes.
         assert_eq!(put("港".repeat(MAX_PUBLIC_REMARK)).await.status(), StatusCode::OK);
+
+        assert_eq!(
+            update_node(
+                Admin,
+                axum::extract::State(app.clone()),
+                Path(id),
+                Ok(Json(
+                    serde_json::from_value(json!({
+                        "provider_image_url": "https://cdn.example.com/provider.png",
+                        "provider_link_url": "https://provider.example.com/",
+                        "nq_link_url": "https://nq.example.com/ref?code=abc"
+                    }))
+                    .unwrap()
+                ))
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let stored = app.db.node(id).unwrap().unwrap();
+        assert_eq!(stored.provider_image_url, "https://cdn.example.com/provider.png");
+        assert_eq!(stored.provider_link_url, "https://provider.example.com/");
+        assert_eq!(stored.nq_link_url, "https://nq.example.com/ref?code=abc");
+        let public = &visible_nodes(&app, false).unwrap()[0];
+        assert_eq!(public["provider_image_url"], "https://cdn.example.com/provider.png");
+        assert_eq!(public["provider_link_url"], "https://provider.example.com/");
+        assert_eq!(public["nq_link_url"], "https://nq.example.com/ref?code=abc");
     }
 
     /// What the panel saves is what an anonymous visitor reads, under the same

@@ -83,6 +83,10 @@ export type Node = {
   remark?: string
   /** Set by hand and public. Absent from a hub predating it. */
   public_remark?: string
+  /** Optional public provider banner and destination. */
+  provider_image_url?: string
+  provider_link_url?: string
+  nq_link_url?: string
   /** Panel only. Whether going offline and returning are announced. */
   notify?: boolean
 }

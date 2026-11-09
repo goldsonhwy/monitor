@@ -905,6 +905,9 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
       public: form.public,
       remark: form.remark,
       public_remark: (form.public_remark ?? "").trim(),
+      provider_image_url: (form.provider_image_url ?? "").trim(),
+      provider_link_url: (form.provider_link_url ?? "").trim(),
+      nq_link_url: (form.nq_link_url ?? "").trim(),
       group: (form.group ?? "").trim(),
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
@@ -966,6 +969,27 @@ function NodeForm({ node, nodes, onClose, onSaved }: {
                     value={form.public_remark ?? ""}
                     onChange={(e) => set("public_remark", e.target.value)}
                     placeholder="公开页可见，最多 100 字"
+                  />
+                </Field>
+                <Field label="服务商图片地址" hint="公开页显示，建议使用 3:1 图片">
+                  <Input
+                    value={form.provider_image_url ?? ""}
+                    onChange={(e) => set("provider_image_url", e.target.value)}
+                    placeholder="https://cdn.example.com/provider.png"
+                  />
+                </Field>
+                <Field label="服务商跳转地址" hint="点击图片后打开">
+                  <Input
+                    value={form.provider_link_url ?? ""}
+                    onChange={(e) => set("provider_link_url", e.target.value)}
+                    placeholder="https://provider.example.com"
+                  />
+                </Field>
+                <Field label="NQ 跳转地址" hint="点击 NQ 图标后打开">
+                  <Input
+                    value={form.nq_link_url ?? ""}
+                    onChange={(e) => set("nq_link_url", e.target.value)}
+                    placeholder="https://example.com"
                   />
                 </Field>
                 <Field label="私有备注">
